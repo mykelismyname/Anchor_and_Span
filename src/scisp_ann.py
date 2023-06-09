@@ -10,6 +10,8 @@ import os
 from scispacy.abbreviation import AbbreviationDetector
 import scispacy
 from scispacy.linking import EntityLinker
+from glob import glob
+from copy import deepcopy
 
 logging.basicConfig(format='%(asctime)s - %(message)s', level=logging.INFO)
 
@@ -19,7 +21,7 @@ def load_model(model_path):
     ann_model.add_pipe("abbreviation_detector")
     return ann_model
 
-def annotate(proc_file, dest, model):
+def annotate_entities(proc_file, dest, model):
     '''
     :param proc_file: file to annotate
     :param model: spacy model to perform entity linking
@@ -76,10 +78,44 @@ def annotate(proc_file, dest, model):
         print(exc_type, fname, exc_tb.tb_lineno)
         raise NotImplementedError("Entity linking with the UMLS KB wasn't successfully implemented")
 
+def annotate_relations(data):
+    files = glob(data+'/*.pkl')
+    for file in files:
+        with open(file, 'rb') as rf, open("test.json", 'wb') :
+            entity_annotations = pickle.load(rf)
+            test = []
+
+            for ann in entity_annotations:
+                #sort entities by sentence
+                labels = []
+                sentences = list(sorted(ann['Entities'], key=lambda x:x[0]['sent_id']))
+                sentences_ = deepcopy(sentences)
+                for e in range(len(sentences)):
+                    entity_type = sentences[e][0]['linked_umls_entities'][0]
+                    l,r = e,e
+                    if len(entity_type) > 0:
+                        if entity_type[0]['type'].lower() == 'clinical drug':
+                            #search to the left and to the right
+                            while l >= 0 or r < len(sentences):
+                                if sentences[l][0]['linked_umls_entities'][0]['type'].lower() == 'Sign or Symptom':
+                                    labels.append({'r':'is_treated_by', 'h':l, 't':e})
+                                elif sentences[r][0]['linked_umls_entities'][0]['type'].lower() == 'Sign or Symptom':
+                                    labels.append({'r': 'is_treated_by', 'h': l, 't': e})
+                                l -= 1
+                                r += 1
+                sentences_['label'] = labels
+
+        break
+
 def main(args):
-    ann_model = load_model(args.model)
-    ann_model.add_pipe("scispacy_linker", config={"linker_name": "umls"})
-    annotate(proc_file=args.data, model=ann_model, dest=args.dest)
+    annotate_type = args.annotate_type.split()
+    if 'entities' in annotate_type:
+        ann_model = load_model(args.model)
+        ann_model.add_pipe("scispacy_linker", config={"linker_name": "umls"})
+        #python scisp_ann.py --data ../NOTESEVENTS_CLEANED.csv --annotation_size "20000 22000"
+        annotate_entities(proc_file=args.data, model=ann_model, dest=args.dest)
+    if 'relations' in annotate_type:
+        annotate_relations(args.data)
 
 if __name__ == '__main__':
     par = argparse.ArgumentParser()
@@ -87,5 +123,7 @@ if __name__ == '__main__':
     par.add_argument('--dest', default='../anns/spacy', help='location of the data')
     par.add_argument('--annotation_size', type=str, help='number of documents to annotate')
     par.add_argument('--model', default='en_core_sci_sm', help='scispacy biomedical model')
+    par.add_argument('--annotate_type', default='entities', help="what to annotate 'entities', or 'relations' or 'entities relations'")
+    par.add_argument('--kg', type=str, default='umls', help='which knoiwledge graph is linked to for annotation')
     args = par.parse_args()
     main(args)
