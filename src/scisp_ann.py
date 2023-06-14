@@ -78,34 +78,129 @@ def annotate_entities(proc_file, dest, model):
         print(exc_type, fname, exc_tb.tb_lineno)
         raise NotImplementedError("Entity linking with the UMLS KB wasn't successfully implemented")
 
+#annotating relations by searching left and right of the detected drugs and or diseases
 def annotate_relations(data):
     files = glob(data+'/*.pkl')
     for file in files:
-        with open(file, 'rb') as rf, open("test.json", 'wb') :
-            entity_annotations = pickle.load(rf)
-            test = []
-
-            for ann in entity_annotations:
-                #sort entities by sentence
-                labels = []
-                sentences = list(sorted(ann['Entities'], key=lambda x:x[0]['sent_id']))
-                sentences_ = deepcopy(sentences)
-                for e in range(len(sentences)):
-                    entity_type = sentences[e][0]['linked_umls_entities'][0]
-                    l,r = e,e
-                    if len(entity_type) > 0:
-                        if entity_type[0]['type'].lower() == 'clinical drug':
+        with open(file, 'rb') as rf, open("test.pkl", 'wb') as wf:
+            doc_annotations = pickle.load(rf)
+            file_annotated = []
+            sentences_ann = {}
+            for i,ann in enumerate(doc_annotations):
+                labels, labels_found = [], False
+                entity_annotations = ann['Entities']
+                sentences_ann['Entities'] = deepcopy(entity_annotations)
+                sentences_ann['Sents'] = ann['Sents']
+                drugs, diseases = [], []
+                # logging.info("Document %d\n"%(i))
+                for e in range(len(entity_annotations)):
+                    # print(e,":",entity_annotations[e][0])
+                    linked_entity_types = entity_annotations[e][0]['linked_umls_entities'] #select linked entity with highest score
+                    if len(linked_entity_types) > 0:
+                        if linked_entity_types[0]['type'].lower() == 'clinical drug':
+                            drugs.append(entity_annotations[e][0]['name'])
+                            # print("Drug:", entity_annotations[e][0]['name'], entity_annotations[e][0]['sent_id'])
                             #search to the left and to the right
-                            while l >= 0 or r < len(sentences):
-                                if sentences[l][0]['linked_umls_entities'][0]['type'].lower() == 'Sign or Symptom':
-                                    labels.append({'r':'is_treated_by', 'h':l, 't':e})
-                                elif sentences[r][0]['linked_umls_entities'][0]['type'].lower() == 'Sign or Symptom':
-                                    labels.append({'r': 'is_treated_by', 'h': l, 't': e})
-                                l -= 1
-                                r += 1
-                sentences_['label'] = labels
+                            l_lab, r_lab = search_linked_entities_left_and_right(e, entity_annotations, ann['Sents'], 'drug_sign or symptom')
+                            unpacked_labels = unpack_relation_and_evidence_labels([r_lab, l_lab])
+                            labels.extend(unpacked_labels)
 
-        break
+                        if linked_entity_types[0]['type'].lower() == 'disease or syndrome':
+                            diseases.append(entity_annotations[e][0]['name'])
+                            # print("Disease:%s"%(e), entity_annotations[e][0]['name'], entity_annotations[e][0]['sent_id'])
+                            # search to the left and to the right
+                            l_lab, r_lab = search_linked_entities_left_and_right(e, entity_annotations, ann['Sents'], 'disease_sign or symptom')
+                            unpacked_labels = unpack_relation_and_evidence_labels([r_lab, l_lab])
+                            labels.extend(unpacked_labels)
+
+                sentences_ann['labels'] = labels
+                file_annotated.append(sentences_ann)
+                if labels:
+                    # for i,j in enumerate(entity_annotations):
+                    #     print(i,":",j[0])
+                    disease_symptom = [i for i in labels if i['rel'] == 'disease_symptom_relation']
+                    drug_symptom = [i for i in labels if i['rel'] == 'drug_symptom_relation']
+                    sents = [" ".join(y) for x,y in enumerate(ann['Sents'])]
+                    sents_joined = " ".join(i for i in sents)
+                    df = pd.DataFrame([sents_joined], columns=['Sentences'])
+                    if disease_symptom:
+                        disease_symptom_df = pd.DataFrame(disease_symptom).rename(columns={"h":"Disease", "t":"Symptom"})
+                        disease_symptom_df['Disease'] = disease_symptom_df['Disease'].apply(lambda x: entity_annotations[int(x)][0]['name'])
+                        disease_symptom_df['Symptom'] = disease_symptom_df['Symptom'].apply(lambda x: entity_annotations[int(x)][0]['name'])
+                        df = pd.concat([df, disease_symptom_df], axis=1)
+                    if drug_symptom:
+                        drug_symptom_df = pd.DataFrame(drug_symptom).rename(columns={"h":"Drug", "t":"Symptom"})
+                        drug_symptom_df['Drug'] = drug_symptom_df['Drug'].apply(lambda x: entity_annotations[int(x)][0]['name'])
+                        drug_symptom_df['Symptom'] = drug_symptom_df['Symptom'].apply(lambda x: entity_annotations[int(x)][0]['name'])
+                        df = pd.concat([df, drug_symptom_df], axis=1)
+
+                    print(df)
+
+            # pickle.dump(file_annotated, wf, protocol=pickle.HIGHEST_PROTOCOL)
+
+def search_linked_entities_left_and_right(e, entity_annotations, sentences, umls_rel_type, search_window=-1):
+    l, r = e - 1, e + 1
+    e1_entity = entity_annotations[e][0]['name']
+    l_lab, r_lab = {e: {}}, {e: {}}
+    search_so_far_right, search_so_far_left = 0, 0
+    umls_type, umls_rel = umls_rel_type.split('_')
+    while l >= 0 or r < len(entity_annotations):
+        left_related_entities = entity_annotations[l][0]['linked_umls_entities'] if l >= 0 else []
+        right_related_entities = entity_annotations[r][0]['linked_umls_entities'] if r < len(entity_annotations) else []
+
+        if len(left_related_entities) > 0:
+            e2_entity = entity_annotations[l][0]['name']
+            # print('left:', l, entity_annotations[l][0]['name'])
+            if left_related_entities[0]['type'].lower() ==  umls_rel:
+                # print(entity_annotations[e][0]['name'], entity_annotations[l][0]['name'])
+                evidence_sentence = entity_annotations[l][0]['sent_id']
+                l_ent = str(l) + '_' + umls_type + '_symptom_relation'
+                if l_ent not in l_lab[e]:
+                    l_lab[e][l_ent] = [evidence_sentence]
+                else:
+                    if evidence_sentence not in l_lab[e][l_ent]:
+                        l_lab[e][l_ent].append(evidence_sentence)
+
+                search_so_far_left += len(sentences[evidence_sentence])
+                if search_so_far_left == search_window:
+                    break
+
+        if len(right_related_entities) > 0:
+            e2_entity = entity_annotations[r][0]['name']
+            # print('right:', r, entity_annotations[r][0]['name'])
+            if right_related_entities[0]['type'].lower() ==  umls_rel:
+                # print(entity_annotations[e][0]['name'], entity_annotations[r][0]['name'])
+                evidence_sentence = entity_annotations[r][0]['sent_id']
+                r_ent = str(r) + '_' + umls_type + '_symptom_relation'
+                if r_ent not in r_lab[e]:
+                    r_lab[e][r_ent] = [evidence_sentence]
+                else:
+                    if evidence_sentence not in r_lab[e][r_ent]:
+                        r_lab[e][r_ent].append(evidence_sentence)
+
+                search_so_far_right += len(sentences[evidence_sentence])
+                if search_so_far_right == search_window:
+                    break
+        l -= 1
+        r += 1
+    return l_lab, r_lab
+
+#unpacking the relation and evidence labels one by one from a dict of dicts
+def unpack_relation_and_evidence_labels(labels):
+    unpacked_labels = []
+    for x in labels:
+        if len(x) > 0:
+            for m in x:
+                if len(x[m]) > 0:
+                    for y in x[m]:
+                        x_r = {}
+                        y_str, relation = y.split('_', 1)
+                        x_r["rel"] = relation
+                        x_r['h'] = m
+                        x_r['t'] = y_str
+                        x_r['evidence'] = x[m][y]
+                        unpacked_labels.append(x_r)
+    return unpacked_labels
 
 def main(args):
     annotate_type = args.annotate_type.split()
@@ -116,6 +211,11 @@ def main(args):
         annotate_entities(proc_file=args.data, model=ann_model, dest=args.dest)
     if 'relations' in annotate_type:
         annotate_relations(args.data)
+        # with open(args.data, 'rb') as rd:
+        #     d = pickle.load(rd)
+        #     for i in d:
+        #         print(i)
+        #         break
 
 if __name__ == '__main__':
     par = argparse.ArgumentParser()
