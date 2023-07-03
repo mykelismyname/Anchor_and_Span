@@ -10,73 +10,71 @@ import os
 from scispacy.abbreviation import AbbreviationDetector
 import scispacy
 from scispacy.linking import EntityLinker
+from scispacy.umls_linking import UmlsEntityLinker
+from scispacy.umls_utils import UmlsKnowledgeBase
 from glob import glob
 from copy import deepcopy
-
+from time import time
+from pyspark.sql import SparkSession
+from multiprocessing import Pool
+import functools
 logging.basicConfig(format='%(asctime)s - %(message)s', level=logging.INFO)
 
-#load spacy model
-def load_model(model_path):
-    ann_model = spacy.load(model_path)
-    ann_model.add_pipe("abbreviation_detector")
-    return ann_model
+# spaCy isn't serializable but loading it is semi-expensive, therefore load the model only when its time to use it
+SPACY_MODEL = None
+def get_spacy_model():
+    global SPACY_MODEL, linker
+    if not SPACY_MODEL:
+        SPACY_MODEL = spacy.load("en_core_sci_sm")
+        linker = EntityLinker(linker_name="umls")
+    return SPACY_MODEL, linker
 
-def annotate_entities(proc_file, dest, model):
+def annotate_entities_linker_unembedded(document):
     '''
-    :param proc_file: file to annotate
-    :param model: spacy model to perform entity linking
+    :param document: text to annotate
     :return: annotated file with token level annotations of entities and sentence level annotations of evidence
     '''
-    proc_file = pd.read_csv(proc_file, low_memory=False)
-    linker = model.get_pipe("scispacy_linker")
-    ann_window = args.annotation_size.split()
-    start, end = int(ann_window[0]), int(ann_window[1])
-    data = proc_file["CLEANED_TEXT"].tolist()
-    if end > -1:
-        data = data[start:end]
+    model, linker = get_spacy_model()
+    dataset_ann = []
 
-    logging.info("The dataset is of size {}".format(len(data)))
-    try:
-        # docs = list(model.pipe(data))
-        dataset_ann = []
-        with open(dest+'/umls_anns_{}_{}.pkl'.format(start, end), 'wb') as umls_writer:
-            for d in data:
-                doc = model(d)
-                doc_ann = {}
-                # doc_sents = []
-                sentences = []
-                sent_entities = []
-                for sent_id,sent in enumerate(doc.sents):
-                    for entity in sent.ents:
-                        entity_annotation = {"name": "{}".format(entity),
-                                             "pos": [entity.start, entity.end],
-                                             "sent_id": sent_id,
-                                             "linked_umls_entities": []}
-                        for umls_ent in entity._.kb_ents:
-                            linked_entity = {}
-                            umls_ent_detail = linker.kb.cui_to_entity[umls_ent[0]]
-                            linked_entity["type_id"] = umls_ent_detail.types[0]
-                            linked_entity["score"] = np.round(umls_ent[1],4)
-                            linked_entity["type"] = linker.kb.semantic_type_tree.get_canonical_name(umls_ent_detail.types[0])
-                            # linked_entity["aliases"] = umls_ent_detail.aliases
+    doc_ann = {}
+    sentences = []
+    sent_entities = []
+    doc = model(document)
+
+    for sent_id,sent in enumerate(doc.sents):
+        for entity in sent.ents:
+            entity_annotation = {"name": "{}".format(entity),
+                                 "pos": [entity.start, entity.end],
+                                 "sent_id": sent_id,
+                                 "linked_umls_entities": []}
+            try:
+                linked_entity = {}
+                cuis = linker.kb.alias_to_cuis[entity.text]
+                linked_entities = []
+                for cui in cuis:
+                    umls_ent = linker.kb.cui_to_entity[cui]
+                    linked_entity["cui"] = cui
+                    for code in umls_ent.types:
+                        if code not in linked_entities:
+                            styname = linker.kb.semantic_type_tree.get_canonical_name(code)
+                            linked_entity["type_id"] = code
+                            linked_entity["type"] = styname
                             entity_annotation["linked_umls_entities"].append(linked_entity)
-                        sent_entities.append([entity_annotation])
-                    # doc_sents.append({"sent_pos": [sent.start, sent.end]})
-                    sentences.append([m.text for m in sent])
-                # doc_sents.append(sent_entities)
-                # dataset_ann.append(doc_sents)
-                doc_ann["Entities"] = sent_entities
-                doc_ann["Sents"] = sentences
-                dataset_ann.append(doc_ann)
-            pickle.dump(dataset_ann, umls_writer, protocol=pickle.HIGHEST_PROTOCOL)
+                            linked_entities.append(code)
+                        else:
+                            pass
+            except KeyError:
+                exc_type, exc_obj, exc_tb = sys.exc_info()
+                logging.warning("Entity - {} can't be found in UMLS".format(entity))
 
-        # print(dataset_ann)
-        logging.info("Number of documents annotated {}".format(len(dataset_ann)))
-    except Exception as e:
-        exc_type, exc_obj, exc_tb = sys.exc_info()
-        fname = os.path.split(exc_tb.tb_frame.f_code.co_filename)[1]
-        print(exc_type, fname, exc_tb.tb_lineno)
-        raise NotImplementedError("Entity linking with the UMLS KB wasn't successfully implemented")
+            sent_entities.append(entity_annotation)
+        sentences.append([m.text for m in sent])
+    doc_ann["Entities"] = sent_entities
+    doc_ann["Sents"] = sentences
+    dataset_ann.append(doc_ann)
+    logging.info("Number of documents annotated {}".format(len(dataset_ann)))
+    return dataset_ann
 
 #annotating relations by searching left and right of the detected drugs and or diseases
 def retrieve_annotations(data, write_to_disk=False):
@@ -101,6 +99,57 @@ def retrieve_annotations(data, write_to_disk=False):
             wf = open(os.path.join(dest_dir, file_name+"_rels.pkl"), 'wb')
             pickle.dump(annotated_text, wf, protocol=pickle.HIGHEST_PROTOCOL)
         return annotated_df
+
+def spacyProcess(model, data):
+    documents = model.pipe(data)
+    return documents
+
+def annotate_entities_linker_embedded(document, model):
+    '''
+        :param document: text to annotate
+        :return: annotated file with token level annotations of entities and sentence level annotations of evidence
+        '''
+    linker = model.get_pipe("scispacy_linker")
+    dataset_ann = []
+    doc_ann = {}
+    sentences = []
+    sent_entities = []
+
+    for sent_id, sent in enumerate(document.sents):
+        for entity in sent.ents:
+            entity_annotation = {"name": "{}".format(entity),
+                                 "pos": [entity.start, entity.end],
+                                 "sent_id": sent_id,
+                                 "linked_umls_entities": []}
+            try:
+                linked_entity = {}
+                linked_entities = []
+                for e in entity._.kb_ents:
+                    cui, cui_score = e
+                    umls_ent = linker.kb.cui_to_entity[cui]
+                    linked_entity["cui"] = cui
+                    linked_entity["score"] = np.round(cui_score, 2)
+                    for code in umls_ent.types:
+                        if code not in linked_entities:
+                            styname = linker.kb.semantic_type_tree.get_canonical_name(code)
+                            linked_entity["type_id"] = code
+                            linked_entity["type"] = styname
+                            entity_annotation["linked_umls_entities"].append(linked_entity)
+                            linked_entities.append(code)
+                        else:
+                            pass
+            except KeyError:
+                exc_type, exc_obj, exc_tb = sys.exc_info()
+                logging.warning("Entity - {} can't be found in UMLS".format(entity))
+
+            sent_entities.append(entity_annotation)
+        sentences.append([m.text for m in sent])
+    doc_ann["Entities"] = sent_entities
+    doc_ann["Sents"] = sentences
+    dataset_ann.append(doc_ann)
+    logging.info("Number of documents annotated {}".format(len(dataset_ann)))
+    return dataset_ann
+
 
 #annotating relations by searching left and right of the detected drugs and or diseases
 def annotate_relations(file):
@@ -238,29 +287,53 @@ def unpack_relation_and_evidence_labels(labels):
 
 def main(args):
     annotate_type = args.annotate_type.split()
+    st = time()
+    data = pd.read_csv(args.data, low_memory=False)
+    annotation_size = args.annotation_size.split()
+    if len(annotation_size) > 1:
+        ann_window = (int(annotation_size[0]), int(annotation_size[1]))
+        start, end = ann_window
+        data = data[start:end]
+
     if 'entities' in annotate_type:
-        ann_model = load_model(args.model)
-        ann_model.add_pipe("scispacy_linker", config={"linker_name": "umls"})
-        #python scisp_ann.py --data ../NOTESEVENTS_CLEANED.csv --annotation_size "20000 22000"
-        annotate_entities(proc_file=args.data, model=ann_model, dest=args.dest)
+        if args.model_linker_embedded:
+            SPACY_MODEL = spacy.load("en_core_sci_sm")
+            SPACY_MODEL.add_pipe("abbreviation_detector")
+            SPACY_MODEL.add_pipe("scispacy_linker", config={"linker_name": "umls"})
+            documents = spacyProcess(SPACY_MODEL, data["CLEANED_TEXT"])
+            with Pool() as pool:
+                _pt_ = functools.partial(annotate_entities_linker_unembedded, SPACY_MODEL)
+                dataset_annotated = pool.map(_pt_, documents)
+                _dataset_annotated = [i[0] for i in dataset_annotated.collect()]
+        else:
+            data_read_spark = spark.createDataFrame(data)
+            data_spark = data_read_spark.select("CLEANED_TEXT").rdd.flatMap(lambda x: x)
+
+            dataset_annotated = data_spark.map(lambda x: annotate_entities_linker_unembedded(x))
+            _dataset_annotated = [i[0] for i in dataset_annotated.collect()]
+
+        with open(args.dest + '/umls_anns_.json', 'w') as umls_writer:
+            json.dump(_dataset_annotated, umls_writer)
+
+        logging.info("Total time taken {}s".format(time() - st))
     if 'relations' in annotate_type:
         #python scisp_ann.py - -data ../anns/spacy/ --annotate_type 'relations'
         annotate_relations(args.data)
     if 'retrieve_annotations' in annotate_type:
         retrieve_annotations(args.data)
-        # with open(args.data, 'rb') as rd:
-        #     d = pickle.load(rd)
-        #     for i in d:
-        #         print(i)
-        #         break
 
 if __name__ == '__main__':
     par = argparse.ArgumentParser()
     par.add_argument('--data', default='../NOTESEVENTS_CLEANED.csv', help='location of the data')
     par.add_argument('--dest', default='../anns/spacy', help='location of the data')
-    par.add_argument('--annotation_size', type=str, help='number of documents to annotate')
     par.add_argument('--model', default='en_core_sci_sm', help='scispacy biomedical model')
     par.add_argument('--annotate_type', default='entities', help="what to annotate 'entities', or 'relations' or 'entities relations'")
     par.add_argument('--kg', type=str, default='umls', help='which knoiwledge graph is linked to for annotation')
+    par.add_argument('--annotation_size', type=str, default="-1", help='number of documents to annotate')
+    par.add_argument('--model_linker_embedded', action="store_true",
+                     help='linker can either be embedded in model or introduced after detecting entities')
+
     args = par.parse_args()
+    spark = SparkSession.builder.master("local").appName("Mimic-II").getOrCreate()
+    # UmlsKnowledgeBase()
     main(args)
