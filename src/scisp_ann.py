@@ -56,14 +56,10 @@ def annotate_entities_linker_unembedded(document):
                     umls_ent = linker.kb.cui_to_entity[cui]
                     linked_entity["cui"] = cui
                     for code in umls_ent.types:
-                        if code not in linked_entities:
-                            styname = linker.kb.semantic_type_tree.get_canonical_name(code)
-                            linked_entity["type_id"] = code
-                            linked_entity["type"] = styname
-                            entity_annotation["linked_umls_entities"].append(linked_entity)
-                            linked_entities.append(code)
-                        else:
-                            pass
+                        styname = linker.kb.semantic_type_tree.get_canonical_name(code)
+                        linked_entity["type_id"] = code
+                        linked_entity["type"] = styname
+                        entity_annotation["linked_umls_entities"].append(linked_entity)
             except KeyError:
                 exc_type, exc_obj, exc_tb = sys.exc_info()
                 logging.warning("Entity - {} can't be found in UMLS".format(entity))
@@ -100,15 +96,18 @@ def retrieve_annotations(data, write_to_disk=False):
             pickle.dump(annotated_text, wf, protocol=pickle.HIGHEST_PROTOCOL)
         return annotated_df
 
-def spacyProcess(model, data):
+def spacyProcess(data, model, dask=False):
+    if dask:
+        data.loc[:,"PROCESSED_TEXT"] = data['CLEANED_TEXT'].apply(lambda x:model(x))
+        return data
     documents = model.pipe(data)
     return documents
 
 def annotate_entities_linker_embedded(document, model):
     '''
-        :param document: text to annotate
-        :return: annotated file with token level annotations of entities and sentence level annotations of evidence
-        '''
+    :param document: text to annotate
+    :return: annotated file with token level annotations of entities and sentence level annotations of evidence
+    '''
     linker = model.get_pipe("scispacy_linker")
     dataset_ann = []
     doc_ann = {}
@@ -122,32 +121,26 @@ def annotate_entities_linker_embedded(document, model):
                                  "sent_id": sent_id,
                                  "linked_umls_entities": []}
             try:
-                linked_entity = {}
                 linked_entities = []
                 for e in entity._.kb_ents:
+                    linked_entity = {}
                     cui, cui_score = e
                     umls_ent = linker.kb.cui_to_entity[cui]
                     linked_entity["cui"] = cui
                     linked_entity["score"] = np.round(cui_score, 2)
                     for code in umls_ent.types:
-                        if code not in linked_entities:
-                            styname = linker.kb.semantic_type_tree.get_canonical_name(code)
-                            linked_entity["type_id"] = code
-                            linked_entity["type"] = styname
-                            entity_annotation["linked_umls_entities"].append(linked_entity)
-                            linked_entities.append(code)
-                        else:
-                            pass
+                        styname = linker.kb.semantic_type_tree.get_canonical_name(code)
+                        linked_entity["type_id"] = code
+                        linked_entity["type"] = styname
+                        entity_annotation["linked_umls_entities"].append(linked_entity)
             except KeyError:
                 exc_type, exc_obj, exc_tb = sys.exc_info()
                 logging.warning("Entity - {} can't be found in UMLS".format(entity))
-
             sent_entities.append(entity_annotation)
         sentences.append([m.text for m in sent])
     doc_ann["Entities"] = sent_entities
     doc_ann["Sents"] = sentences
     dataset_ann.append(doc_ann)
-    logging.info("Number of documents annotated {}".format(len(dataset_ann)))
     return dataset_ann
 
 
