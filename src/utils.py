@@ -1,4 +1,5 @@
 import numpy as np
+import os
 
 #create spans of batches that would be used toselect chunks of documents that can be processed by Text analytics without which ratelimitting errors
 def batching_for_textanalyticsclinet(batch, size):
@@ -40,3 +41,10 @@ def fecth_entitis_span_pos(entity, sentence):
             except Exception as e:
                 return span
     return span
+
+#create a directory is missing
+def createDir(path):
+    dest = path
+    if not os.path.exists(path):
+        dest = os.makedirs(path)
+    return dest
