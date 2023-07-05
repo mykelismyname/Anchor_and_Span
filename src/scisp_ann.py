@@ -17,7 +17,10 @@ from copy import deepcopy
 from time import time
 from pyspark.sql import SparkSession
 from multiprocessing import Pool
+import dask.dataframe as dd
+import dask.array as da
 import functools
+import utils
 logging.basicConfig(format='%(asctime)s - %(message)s', level=logging.INFO)
 
 # spaCy isn't serializable but loading it is semi-expensive, therefore load the model only when its time to use it
@@ -29,6 +32,7 @@ def get_spacy_model():
         linker = EntityLinker(linker_name="umls")
     return SPACY_MODEL, linker
 
+#model is used to detect entities and linker introduced to link detected entities
 def annotate_entities_linker_unembedded(document):
     '''
     :param document: text to annotate
@@ -72,30 +76,7 @@ def annotate_entities_linker_unembedded(document):
     logging.info("Number of documents annotated {}".format(len(dataset_ann)))
     return dataset_ann
 
-#annotating relations by searching left and right of the detected drugs and or diseases
-def retrieve_annotations(data, write_to_disk=False):
-    if os.path.isdir(data):
-        files = glob(data+'/*.pkl')
-        for file in files:
-            annotated_text, annotated_df = annotate_relations(file)
-            if write_to_disk:
-                file_name, file_ext = data.split('.')
-                dest_dir = os.path.dirname(data) + '/' + os.path.basename(data) + '_rels'
-                if not os.path.exists(dest_dir):
-                    os.makedirs(dest_dir)
-                    wf = open(os.path.join(dest_dir, file_ext + "_rels.pkl"), 'wb')
-                    pickle.dump(annotated_text, wf, protocol=pickle.HIGHEST_PROTOCOL)
-    elif os.path.isfile(data):
-        annotated_text, annotated_df = annotate_relations(data)
-        if write_to_disk:
-            file_name, file_ext = os.path.basename(data).split('.')
-            dest_dir = os.path.dirname(data) + '/' + 'rel_anns'
-            if not os.path.exists(dest_dir):
-                os.makedirs(dest_dir)
-            wf = open(os.path.join(dest_dir, file_name+"_rels.pkl"), 'wb')
-            pickle.dump(annotated_text, wf, protocol=pickle.HIGHEST_PROTOCOL)
-        return annotated_df
-
+#using spacy multiprocess pip function to multiprocess data
 def spacyProcess(data, model, dask=False):
     if dask:
         data.loc[:,"PROCESSED_TEXT"] = data['CLEANED_TEXT'].apply(lambda x:model(x))
@@ -103,6 +84,19 @@ def spacyProcess(data, model, dask=False):
     documents = model.pipe(data)
     return documents
 
+#function to call the actual model embedded annotation function
+def call_annotate_emb(data, model):
+    data.loc[:, "ANNOTATED_TEXT"] = data["PROCESSED_TEXT"].apply(
+        lambda x: annotate_entities_linker_embedded(x, model))
+    return data
+
+#function to call the actual model unembedded annotation function
+def call_annotate_unemb(data):
+    data.loc[:, "ANNOTATED_TEXT"] = data["PROCESSED_TEXT"].apply(
+        lambda x: annotate_entities_linker_unembedded(x))
+    return data
+
+#model is used to detect entities and linker introduced to link detected entities
 def annotate_entities_linker_embedded(document, model):
     '''
     :param document: text to annotate
@@ -279,35 +273,67 @@ def unpack_relation_and_evidence_labels(labels):
     return unpacked_labels
 
 def main(args):
-    annotate_type = args.annotate_type.split()
     st = time()
-    data = pd.read_csv(args.data, low_memory=False)
+    # chunks = pd.read_csv(args.data, chunksize=100000, low_memory=False)
+    # data = pd.concat(chunks)
+    data_set = dd.read_csv(args.data, encoding="utf-8", engine="python", on_bad_lines="warn")
+    data_ = data_set[["CLEANED_TEXT"]]
+
     annotation_size = args.annotation_size.split()
     if len(annotation_size) > 1:
         ann_window = (int(annotation_size[0]), int(annotation_size[1]))
         start, end = ann_window
-        data = data[start:end]
+        _data_ = data_.compute()[start:end]
+    else:
+        _data_ = data_.compute()
+        start, end = 0, len(_data_)
+
+    logging.info("Dataset successfully loaded")
+
+    SPACY_MODEL = spacy.load(_model_)
+    dest = utils.createDir(args.dest)
 
     if 'entities' in annotate_type:
         if args.model_linker_embedded:
-            SPACY_MODEL = spacy.load("en_core_sci_sm")
-            SPACY_MODEL.add_pipe("abbreviation_detector")
             SPACY_MODEL.add_pipe("scispacy_linker", config={"linker_name": "umls"})
-            documents = spacyProcess(SPACY_MODEL, data["CLEANED_TEXT"])
-            with Pool() as pool:
-                _pt_ = functools.partial(annotate_entities_linker_unembedded, SPACY_MODEL)
-                dataset_annotated = pool.map(_pt_, documents)
-                _dataset_annotated = [i[0] for i in dataset_annotated.collect()]
+            if args.dask:
+                data = dd.from_pandas(_data_, npartitions=data_.npartitions)
+                documents = data.map_partitions(spacyProcess, SPACY_MODEL, dask=True,
+                                                meta=pd.DataFrame(columns=["CLEANED_TEXT", "PROCESSED_TEXT"]))
+                dataset_annotated = documents[["PROCESSED_TEXT"]].map_partitions(call_annotate_emb, SPACY_MODEL,
+                                                                                 meta=pd.DataFrame(
+                                                                                     columns=["PROCESSED_TEXT",
+                                                                                              "ANNOTATED_TEXT"]))
+                _dataset_annotated = [i[0] for i in dataset_annotated["ANNOTATED_TEXT"].compute()]
+            else:
+                cleaned_text = _data_["CLEANED_TEXT"].tolist()
+                documents = spacyProcess(cleaned_text, SPACY_MODEL)
+                dataset_annotated = [annotate_entities_linker_embedded(i, SPACY_MODEL) for i in documents]
+                _dataset_annotated = [i[0] for i in dataset_annotated]
+            logging.info("Number of documents annotated {}".format(len(_dataset_annotated)))
         else:
-            data_read_spark = spark.createDataFrame(data)
-            data_spark = data_read_spark.select("CLEANED_TEXT").rdd.flatMap(lambda x: x)
+            if args.dask:
+                data = dd.from_pandas(_data_, npartitions=data_.npartitions)
+                documents = data.map_partitions(spacyProcess, SPACY_MODEL, dask=True,
+                                                meta=pd.DataFrame(columns=["CLEANED_TEXT", "PROCESSED_TEXT"]))
+                dataset_annotated = documents[["PROCESSED_TEXT"]].map_partitions(call_annotate_unemb, meta=pd.DataFrame(
+                    columns=["PROCESSED_TEXT", "ANNOTATED_TEXT"]))
+                _dataset_annotated = [i[0] for i in dataset_annotated["ANNOTATED_TEXT"].compute()]
+            else:
+                data_read_spark = spark.createDataFrame(_data_)
+                data_spark = data_read_spark.select("CLEANED_TEXT").rdd.flatMap(lambda x: x)
+                dataset_annotated = data_spark.map(lambda x: annotate_entities_linker_unembedded(x))
+                _dataset_annotated = [i[0] for i in dataset_annotated.collect()]
+            logging.info("Number of documents annotated {}".format(len(_dataset_annotated)))
 
-            dataset_annotated = data_spark.map(lambda x: annotate_entities_linker_unembedded(x))
-            _dataset_annotated = [i[0] for i in dataset_annotated.collect()]
-
-        with open(args.dest + '/umls_anns_.json', 'w') as umls_writer:
-            json.dump(_dataset_annotated, umls_writer)
-
+        if args.pickle_output:
+            dest_file = os.path.join(dest, 'scispac_anns_{}_{}.pkl'.format(start, end))
+            with open(dest_file, 'wb') as wf:
+                pickle.dump(_dataset_annotated, wf, protocol=pickle.HIGHEST_PROTOCOL)
+        else:
+            dest_file = os.path.join(dest, 'scispac_anns_{}_{}.json'.format(start, end))
+            with open(dest_file, 'w') as wf:
+                json.dump(_dataset_annotated, wf)
         logging.info("Total time taken {}s".format(time() - st))
     if 'relations' in annotate_type:
         #python scisp_ann.py - -data ../anns/spacy/ --annotate_type 'relations'
@@ -323,10 +349,13 @@ if __name__ == '__main__':
     par.add_argument('--annotate_type', default='entities', help="what to annotate 'entities', or 'relations' or 'entities relations'")
     par.add_argument('--kg', type=str, default='umls', help='which knoiwledge graph is linked to for annotation')
     par.add_argument('--annotation_size', type=str, default="-1", help='number of documents to annotate')
-    par.add_argument('--model_linker_embedded', action="store_true",
-                     help='linker can either be embedded in model or introduced after detecting entities')
+    par.add_argument('--dask', action="store_true", help='use dask for multi-processing')
+    par.add_argument('--model_linker_embedded', action="store_true", help='linker can either be embedded in model or introduced after detecting entities')
+    par.add_argument('--pickle_output', action="store_true", help='save output as a pickle object')
 
     args = par.parse_args()
     spark = SparkSession.builder.master("local").appName("Mimic-II").getOrCreate()
+    spark.sparkContext.setLogLevel("ERROR")
+    _model_ = args.model
     # UmlsKnowledgeBase()
     main(args)
