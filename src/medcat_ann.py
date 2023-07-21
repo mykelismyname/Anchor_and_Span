@@ -57,27 +57,25 @@ def createDocumentMap(documents):
 def extractAnnotations(results, sentences, document_sent_map):
     dataset_ann = []
     for doc_id, document_sent_range in document_sent_map.items():
-        print(doc_id, document_sent_range)
+        # print(doc_id, document_sent_range)
         doc_ann = {}
         doc_entities = []
         sents = []
         for sent_id, doc in enumerate(results):
             if sent_id in range(document_sent_range[0], document_sent_range[-1]):
-                sents.append(sentences[sent_id])
-                print(sentences[sent_id])
-                # print(results[doc]['entities'])
+                sents.append(sentences[sent_id].split())
                 for k, v in results[doc]['entities'].items():
                     entity = {}
                     _entity_ = (v['start'], v['end'], v['source_value'])
                     entity_text, entity_span_pos = utils.fetch_entitis_span_pos(_entity_, sentences[sent_id], "MEDCAT")
-                    entity['name'] = v['source_value']
-                    entity['sent_id'] = sent_id
-                    print(entity_span_pos)
                     try:
                         assert len(entity_span_pos) == 2
-                        entity['pos'] = [entity_span_pos[0], entity_span_pos[-1]]
+                        entity['token_pos'] = [entity_span_pos[0], entity_span_pos[-1]]
                     except AssertionError:
-                        entity['pos'] = []
+                        entity['token_pos'] = [entity_span_pos[0]]
+                    entity['name'] = entity_text
+                    entity['sent_id'] = sent_id
+                    entity['char_position'] = [v['start'], v['end']]
                     entity['score'] = v['acc']
                     entity['linked_entities'] = []
                     linked_entity = {}
@@ -87,16 +85,11 @@ def extractAnnotations(results, sentences, document_sent_map):
                         linked_entity['type_id'] = n
                         entity['linked_entities'].append(linked_entity)
                     if entity:
-                        print(entity)
                         doc_entities.append(entity)
             if sent_id == (document_sent_range[-1] - 1):
-                print(
-                    "=====================================================================================================")
                 break
         doc_ann['Entities'] = doc_entities
         doc_ann['Sents'] = sents
-        # doc_ann['Sents'] = [sentences[i] for i in range(document_sent_range[0], document_sent_range[-1])]
-        # print(doc_ann)
         dataset_ann.append(doc_ann)
     return dataset_ann
 
@@ -132,8 +125,8 @@ def main(args):
     logging.info('---ANNOTATION BEGINS---')
     st_time = time.time()
     if not args.multiprocessing:
-        _data_.loc[:, 'ENTITIES'] = ann_file_.loc[:, 'CLEANED_TEXT'].apply(lambda x: medcat_model.get_entities(x))
-        annotations = ann_file_['ENTITIES'].tolist()
+        #...
+        pass
     else:
         logging.info('---multi processing---')
         annotations = medcat_model.multiprocessing(data_iterator(processed_data),
@@ -141,13 +134,13 @@ def main(args):
 
     dataset_annotated = extractAnnotations(annotations, sentences, document_sent_map)
 
-    dest = utils.createDir(args.dest)
+    dest_dir = utils.createDir(args.dest)
     print('------------------------ANNOTATION ENDS------------------------')
 
-    # annotation_file = 'anns_mult_{}_{}.pkl'.format(start, end) if args.multiprocessing else 'anns_{}_{}.pkl'.format(start, end)
-    # with open(os.path.join(args.dest, annotation_file), 'wb') as a:
-    #     pickle.dump(annotations, a, protocol=pickle.HIGHEST_PROTOCOL)
-    #     a.close()
+    annotation_file = 'anns_mult_{}_{}.pkl'.format(start, end) if args.multiprocessing else 'anns_{}_{}.pkl'.format(start, end)
+    with open(os.path.join(dest_dir, annotation_file), 'wb') as a:
+        pickle.dump(dataset_annotated, a, protocol=pickle.HIGHEST_PROTOCOL)
+        a.close()
 
     logging.info("Total time taken {}s".format(time.time() - st_time))
 
@@ -167,6 +160,3 @@ if __name__ == '__main__':
     # specifying spacy and scispacy model parameters
     spacy_model = spacy.load(args.spacy_model)
     main(args)
-
-
-
