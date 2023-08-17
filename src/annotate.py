@@ -90,7 +90,7 @@ if __name__ == '__main__':
     par = ArgumentParser()
     par.add_argument('--data', default='../NOTEEVENTS.csv.gz', help='data')
     par.add_argument('--dest', default='../anns/', help='location to store annotation file')
-    par.add_argument('--model', default='models/medmen_wstatus_2021_oct.zip', type=str, help='model location')
+    par.add_argument('--model', default='../models/medmen_wstatus_2021_oct.zip', type=str, help='model location')
     par.add_argument('--cleaning', action='store_true', help='clean the dataset or not')
     par.add_argument('--annotation_size', type=str, help='number of documents to annotate')
     par.add_argument('--concepts', default=['T047', 'T048', 'T200', 'T184'], type=list, help='concepts to annotate')
@@ -98,6 +98,6 @@ if __name__ == '__main__':
     par.add_argument('--batch_size_chars', default=500000, type=int, help='Batch size (BS) in number of characters')
     args = par.parse_args()
     main(args)
-    
+
 
 
